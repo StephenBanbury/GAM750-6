@@ -1,12 +1,8 @@
 /************************************************************************************
 Copyright : Copyright (c) Facebook Technologies, LLC and its affiliates. All rights reserved.
 
-Licensed under the Oculus Master SDK License Version 1.0 (the "License"); you may not use
-the Utilities SDK except in compliance with the License, which is provided at the time of installation
-or download, or which otherwise accompanies this software in either electronic or hard copy form.
-
-You may obtain a copy of the License at
-https://developer.oculus.com/licenses/oculusmastersdk-1.0/
+Your use of this SDK or tool is subject to the Oculus SDK License Agreement, available at
+https://developer.oculus.com/licenses/oculussdk/
 
 Unless required by applicable law or agreed to in writing, the Utilities SDK distributed
 under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
@@ -18,6 +14,7 @@ using UnityEngine;
 using System;
 using System.Collections;
 using System.Runtime.InteropServices;
+using System.Collections.Generic;
 
 /// <summary>
 /// Add OVROverlay script to an object with an optional mesh primitive
@@ -45,6 +42,7 @@ using System.Runtime.InteropServices;
 ///					Which is usually not what people wanted, we don't kill the ability for developer to do so here, but will warn out.
 ///		5. Equirect: Display overlay as a 360-degree equirectangular skybox.
 /// </summary>
+[ExecuteInEditMode]
 public class OVROverlay : MonoBehaviour
 {
 #region Interface
@@ -59,6 +57,9 @@ public class OVROverlay : MonoBehaviour
 		Cubemap = OVRPlugin.OverlayShape.Cubemap,
 		OffcenterCubemap = OVRPlugin.OverlayShape.OffcenterCubemap,
 		Equirect = OVRPlugin.OverlayShape.Equirect,
+		ReconstructionPassthrough = OVRPlugin.OverlayShape.ReconstructionPassthrough,
+		SurfaceProjectedPassthrough = OVRPlugin.OverlayShape.SurfaceProjectedPassthrough,
+		Fisheye = OVRPlugin.OverlayShape.Fisheye,
 	}
 
 	/// <summary>
@@ -95,6 +96,9 @@ public class OVROverlay : MonoBehaviour
 	public Rect destRectLeft = new Rect();
 	public Rect destRectRight = new Rect();
 
+	// Used to support legacy behavior where the top left was considered the origin
+	public bool invertTextureRects = false;
+
 	private OVRPlugin.TextureRectMatrixf textureRectMatrix = OVRPlugin.TextureRectMatrixf.zero;
 
 	public bool overrideTextureRectMatrix = false;
@@ -110,6 +114,7 @@ public class OVROverlay : MonoBehaviour
 
 	//Property that can hide overlays when required. Should be false when present, true when hidden.
 	public bool hidden = false;
+
 
 	/// <summary>
 	/// If true, the layer will be created as an external surface. externalSurfaceObject contains the Surface object. It's effective only on Android.
@@ -134,12 +139,13 @@ public class OVROverlay : MonoBehaviour
 	/// </summary>
 	[Tooltip("The compositionDepth defines the order of the OVROverlays in composition. The overlay/underlay with smaller compositionDepth would be composited in the front of the overlay/underlay with larger compositionDepth.")]
 	public int compositionDepth = 0;
+	private int layerCompositionDepth = 0;
 
 	/// <summary>
 	/// The noDepthBufferTesting will stop layer's depth buffer compositing even if the engine has "Depth buffer sharing" enabled on Rift.
 	/// </summary>
-	[Tooltip("The noDepthBufferTesting will stop layer's depth buffer compositing even if the engine has \"Shared Depth Buffer\" enabled")]
-	public bool noDepthBufferTesting = false;
+	[Tooltip("The noDepthBufferTesting will stop layer's depth buffer compositing even if the engine has \"Shared Depth Buffer\" enabled. The layer's ordering will be used instead which is determined by it's composition depth and overlay/underlay type.")]
+	public bool noDepthBufferTesting = true;
 
 	//Format corresponding to the source texture for this layer. sRGB by default, but can be modified if necessary
 	public OVRPlugin.EyeTextureFormat layerTextureFormat = OVRPlugin.EyeTextureFormat.R8G8B8A8_sRGB;
@@ -161,6 +167,28 @@ public class OVROverlay : MonoBehaviour
 	[Tooltip("When checked, the texture is treated as if the alpha was already premultiplied")]
 	public bool isAlphaPremultiplied = false;
 
+
+	/// <summary>
+	/// Preview the overlay in the editor using a mesh renderer.
+	/// </summary>
+	public bool previewInEditor {
+		get {
+			return _previewInEditor;
+		}
+		set {
+			if (_previewInEditor != value) {
+				_previewInEditor = value;
+				SetupEditorPreview();
+			}
+		}
+	}
+
+	[SerializeField]
+	private bool _previewInEditor = false;
+
+#if UNITY_EDITOR
+	private GameObject previewObject;
+#endif
 
 	protected IntPtr[] texturePtrs = new IntPtr[] { IntPtr.Zero, IntPtr.Zero };
 
@@ -197,7 +225,9 @@ public class OVROverlay : MonoBehaviour
 	internal const int maxInstances = 15;
 	public static OVROverlay[] instances = new OVROverlay[maxInstances];
 
-#endregion
+	public int layerId { get; private set; } = 0; // The layer's internal handle in the compositor.
+
+	#endregion
 
 	private static Material tex2DMaterial;
 	private static Material cubeMaterial;
@@ -224,8 +254,6 @@ public class OVROverlay : MonoBehaviour
 	private int stageCount = -1;
 
 	private int layerIndex = -1; // Controls the composition order based on wake-up time.
-
-	private int layerId = 0; // The layer's internal handle in the compositor.
 	private GCHandle layerIdHandle;
 	private IntPtr layerIdPtr = IntPtr.Zero;
 
@@ -235,6 +263,11 @@ public class OVROverlay : MonoBehaviour
 	private Renderer rend;
 
 	private int texturesPerStage { get { return (layout == OVRPlugin.LayerLayout.Stereo) ? 2 : 1; } }
+
+	private static bool NeedsTexturesForShape(OverlayShape shape)
+	{
+		return !IsPassthroughShape(shape);
+	}
 
 	private bool CreateLayer(int mipLevels, int sampleCount, OVRPlugin.EyeTextureFormat etFormat, int flags, OVRPlugin.Sizei size, OVRPlugin.OverlayShape shape)
 	{
@@ -265,7 +298,8 @@ public class OVROverlay : MonoBehaviour
 			layerDesc.Layout != layout ||
 			layerDesc.LayerFlags != flags ||
 			!layerDesc.TextureSize.Equals(size) ||
-			layerDesc.Shape != shape);
+			layerDesc.Shape != shape ||
+			layerCompositionDepth != compositionDepth);
 
 		if (!needsSetup)
 			return false;
@@ -277,6 +311,7 @@ public class OVROverlay : MonoBehaviour
 		if (layerId > 0)
 		{
 			layerDesc = desc;
+			layerCompositionDepth = compositionDepth;
 			if (isExternalSurface)
 			{
 				stageCount = 1;
@@ -417,16 +452,29 @@ public class OVROverlay : MonoBehaviour
 
 	public void UpdateTextureRectMatrix()
 	{
-		Rect srcRectLeftConverted = new Rect(srcRectLeft.x, 1 - srcRectLeft.y - srcRectLeft.height, srcRectLeft.width, srcRectLeft.height);
-		Rect srcRectRightConverted = new Rect(srcRectRight.x, 1 - srcRectRight.y - srcRectRight.height, srcRectRight.width, srcRectRight.height);
+		// External surfaces are encoded with reversed UV's, so our texture rects are also inverted
+		Rect srcRectLeftConverted = new Rect(srcRectLeft.x, isExternalSurface ^ invertTextureRects ? 1 - srcRectLeft.y - srcRectLeft.height : srcRectLeft.y, srcRectLeft.width, srcRectLeft.height);
+		Rect srcRectRightConverted = new Rect(srcRectRight.x, isExternalSurface ^ invertTextureRects ? 1 - srcRectRight.y - srcRectRight.height : srcRectRight.y, srcRectRight.width, srcRectRight.height);
+		Rect destRectLeftConverted = new Rect(destRectLeft.x, isExternalSurface ^ invertTextureRects ? 1 - destRectLeft.y - destRectLeft.height : destRectLeft.y, destRectLeft.width, destRectLeft.height);
+		Rect destRectRightConverted = new Rect(destRectRight.x, isExternalSurface ^ invertTextureRects ? 1 - destRectRight.y - destRectRight.height : destRectRight.y, destRectRight.width, destRectRight.height);
 		textureRectMatrix.leftRect = srcRectLeftConverted;
 		textureRectMatrix.rightRect = srcRectRightConverted;
-		float leftWidthFactor = srcRectLeftConverted.width / destRectLeft.width;
-		float leftHeightFactor = srcRectLeftConverted.height / destRectLeft.height;
-		textureRectMatrix.leftScaleBias = new Vector4(leftWidthFactor, leftHeightFactor, srcRectLeftConverted.x - destRectLeft.x * leftWidthFactor, srcRectLeftConverted.y - destRectLeft.y * leftHeightFactor);
-		float rightWidthFactor = srcRectRightConverted.width / destRectRight.width;
-		float rightHeightFactor = srcRectRightConverted.height / destRectRight.height;
-		textureRectMatrix.rightScaleBias = new Vector4(rightWidthFactor, rightHeightFactor, srcRectRightConverted.x - destRectRight.x * rightWidthFactor, srcRectRightConverted.y - destRectRight.y * rightHeightFactor);
+
+		// Fisheye layer requires a 0.5f offset for texture to be centered on the fisheye projection
+		if (currentOverlayShape == OverlayShape.Fisheye)
+		{
+			destRectLeftConverted.x -= 0.5f;
+			destRectLeftConverted.y -= 0.5f;
+			destRectRightConverted.x -= 0.5f;
+			destRectRightConverted.y -= 0.5f;
+		}
+
+		float leftWidthFactor = srcRectLeft.width / destRectLeft.width;
+		float leftHeightFactor = srcRectLeft.height / destRectLeft.height;
+		textureRectMatrix.leftScaleBias = new Vector4(leftWidthFactor, leftHeightFactor, srcRectLeftConverted.x - destRectLeftConverted.x * leftWidthFactor, srcRectLeftConverted.y - destRectLeftConverted.y * leftHeightFactor);
+		float rightWidthFactor = srcRectRight.width / destRectRight.width;
+		float rightHeightFactor = srcRectRight.height / destRectRight.height;
+		textureRectMatrix.rightScaleBias = new Vector4(rightWidthFactor, rightHeightFactor, srcRectRightConverted.x - destRectRightConverted.x * rightWidthFactor, srcRectRightConverted.y - destRectRightConverted.y * rightHeightFactor);
 	}
 
 	public void SetPerLayerColorScaleAndOffset(Vector4 scale, Vector4 offset)
@@ -501,7 +549,7 @@ public class OVROverlay : MonoBehaviour
 			textureSize.w = externalSurfaceWidth;
 			textureSize.h = externalSurfaceHeight;
 		}
-		else
+		else if (NeedsTexturesForShape(currentOverlayShape))
 		{
 			if (textures[0] == null)
 			{
@@ -557,6 +605,7 @@ public class OVROverlay : MonoBehaviour
 		{
 			newDesc.LayerFlags |= (int)OVRPlugin.LayerFlags.AndroidSurfaceSwapChain;
 		}
+
 
 		return newDesc;
 	}
@@ -678,6 +727,7 @@ public class OVROverlay : MonoBehaviour
 
 					blitMat.SetInt("_linearToSrgb", linearToSRGB ? 1 : 0);
 					blitMat.SetInt("_premultiply", premultiplyAlpha ? 1 : 0);
+					blitMat.SetInt("_flip", OVRPlugin.nativeXrApi == OVRPlugin.XrApi.OpenXR ? 1 : 0);
 				}
 
 				if (currentOverlayShape != OverlayShape.Cubemap && currentOverlayShape != OverlayShape.OffcenterCubemap)
@@ -736,9 +786,10 @@ public class OVROverlay : MonoBehaviour
 		{
 			UpdateTextureRectMatrix();
 		}
+		bool noTextures = isExternalSurface || !NeedsTexturesForShape(currentOverlayShape);
 		bool isOverlayVisible = OVRPlugin.EnqueueSubmitLayer(overlay, headLocked, noDepthBufferTesting,
-			isExternalSurface ? System.IntPtr.Zero : layerTextures[0].appTexturePtr,
-			isExternalSurface ? System.IntPtr.Zero : layerTextures[rightEyeIndex].appTexturePtr,
+			noTextures ? System.IntPtr.Zero : layerTextures[0].appTexturePtr,
+			noTextures ? System.IntPtr.Zero : layerTextures[rightEyeIndex].appTexturePtr,
 			layerId, frameIndex, pose.flipZ().ToPosef_Legacy(), scale.ToVector3f(), layerIndex, (OVRPlugin.OverlayShape)currentOverlayShape,
 			overrideTextureRectMatrix, textureRectMatrix, overridePerLayerColorScaleAndOffset, colorScale, colorOffset, useExpensiveSuperSample,
 			hidden);
@@ -748,17 +799,46 @@ public class OVROverlay : MonoBehaviour
 		return isOverlayVisible;
 	}
 
-#region Unity Messages
+	private void SetupEditorPreview()
+	{
+		#if UNITY_EDITOR
+			if (previewInEditor && previewObject == null)
+			{
+				previewObject = new GameObject();
+				previewObject.hideFlags = HideFlags.HideAndDontSave;
+				previewObject.transform.SetParent(this.transform, false);
+				OVROverlayMeshGenerator generator = previewObject.AddComponent<OVROverlayMeshGenerator>();
+				generator.SetOverlay(this);
+
+			}
+			else if (!previewInEditor && previewObject != null)
+			{
+				UnityEngine.Object.DestroyImmediate(previewObject);
+				previewObject = null;
+			}
+#endif
+	}
+
+	public static bool IsPassthroughShape(OverlayShape shape)
+	{
+		return shape == OverlayShape.ReconstructionPassthrough
+			|| shape == OverlayShape.SurfaceProjectedPassthrough;
+	}
+
+	#region Unity Messages
 
 	void Awake()
 	{
 		Debug.Log("Overlay Awake");
 
-		if (tex2DMaterial == null)
-			tex2DMaterial = new Material(Shader.Find("Oculus/Texture2D Blit"));
+		if (Application.isPlaying)
+		{
+			if (tex2DMaterial == null)
+				tex2DMaterial = new Material(Shader.Find("Oculus/Texture2D Blit"));
 
-		if (cubeMaterial == null)
-			cubeMaterial = new Material(Shader.Find("Oculus/Cubemap Blit"));
+			if (cubeMaterial == null)
+				cubeMaterial = new Material(Shader.Find("Oculus/Cubemap Blit"));
+		}
 
 		rend = GetComponent<Renderer>();
 
@@ -768,6 +848,8 @@ public class OVROverlay : MonoBehaviour
 		// Backward compatibility
 		if (rend != null && textures[0] == null)
 			textures[0] = rend.material.mainTexture;
+
+		SetupEditorPreview();
 	}
 
 	static public string OpenVROverlayKey { get { return "unity:" + Application.companyName + "." + Application.productName; } }
@@ -777,6 +859,12 @@ public class OVROverlay : MonoBehaviour
 	{
 		if (OVRManager.OVRManagerinitialized)
 			InitOVROverlay();
+
+	#if UNITY_EDITOR
+		if (previewObject != null) {
+			previewObject.SetActive(true);
+		}
+	#endif
 	}
 
 	void InitOVROverlay()
@@ -813,6 +901,13 @@ public class OVROverlay : MonoBehaviour
 
 	void OnDisable()
 	{
+
+	#if UNITY_EDITOR
+		if (previewObject != null) {
+			previewObject.SetActive(false);
+		}
+	#endif
+
 		if ((gameObject.hideFlags & HideFlags.DontSaveInBuild) != 0)
 			return;
 
@@ -847,6 +942,12 @@ public class OVROverlay : MonoBehaviour
 	{
 		DestroyLayerTextures();
 		DestroyLayer();
+
+	#if UNITY_EDITOR
+		if (previewObject != null) {
+			GameObject.DestroyImmediate(previewObject);
+		}
+	#endif
 	}
 
 	bool ComputeSubmit(ref OVRPose pose, ref Vector3 scale, ref bool overlay, ref bool headLocked)
@@ -866,8 +967,11 @@ public class OVROverlay : MonoBehaviour
 		if (currentOverlayShape == OverlayShape.Cubemap)
 		{
 #if UNITY_ANDROID && !UNITY_EDITOR
-			//HACK: VRAPI cubemaps assume are yawed 180 degrees relative to LibOVR.
-			pose.orientation = pose.orientation * Quaternion.AngleAxis(180, Vector3.up);
+			if (OVRPlugin.nativeXrApi != OVRPlugin.XrApi.OpenXR)
+			{
+				//HACK: VRAPI cubemaps assume are yawed 180 degrees relative to LibOVR.
+				pose.orientation = pose.orientation * Quaternion.AngleAxis(180, Vector3.up);
+			}
 #endif
 			pose.position = headCamera.transform.position;
 		}
@@ -883,8 +987,8 @@ public class OVROverlay : MonoBehaviour
 			}
 		}
 
-		// Cylinder overlay sanity checking
-		if (currentOverlayShape == OverlayShape.Cylinder)
+		// Cylinder overlay sanity checking when not using OpenXR
+		if (OVRPlugin.nativeXrApi != OVRPlugin.XrApi.OpenXR && currentOverlayShape == OverlayShape.Cylinder)
 		{
 			float arcAngle = scale.x / scale.z / (float)Math.PI * 180.0f;
 			if (arcAngle > 180.0f)
@@ -892,6 +996,12 @@ public class OVROverlay : MonoBehaviour
 				Debug.LogWarning("Cylinder overlay's arc angle has to be below 180 degree, current arc angle is " + arcAngle + " degree." );
 				return false;
 			}
+		}
+
+		if (OVRPlugin.nativeXrApi == OVRPlugin.XrApi.OpenXR && currentOverlayShape == OverlayShape.Fisheye)
+		{
+			Debug.LogWarning("Fisheye overlay shape is not support on OpenXR");
+			return false;
 		}
 
 		return true;
@@ -966,8 +1076,12 @@ public class OVROverlay : MonoBehaviour
 		// The overlay must be specified every eye frame, because it is positioned relative to the
 		// current head location.  If frames are dropped, it will be time warped appropriately,
 		// just like the eye buffers.
-		if (currentOverlayType == OverlayType.None || ((textures.Length < texturesPerStage || textures[0] == null) && !isExternalSurface))
+		bool requiresTextures = !isExternalSurface && NeedsTexturesForShape(currentOverlayShape);
+		if (currentOverlayType == OverlayType.None ||
+			(requiresTextures && (textures.Length < texturesPerStage || textures[0] == null)))
+		{
 			return;
+		}
 
 		OVRPose pose = OVRPose.identity;
 		Vector3 scale = Vector3.one;
@@ -987,8 +1101,12 @@ public class OVROverlay : MonoBehaviour
 		OVRPlugin.LayerDesc newDesc = GetCurrentLayerDesc();
 		bool isHdr = (newDesc.Format == OVRPlugin.EyeTextureFormat.R16G16B16A16_FP);
 
-		// If the layer and textures are created but sizes differ, force re-creating them
-		if (!layerDesc.TextureSize.Equals(newDesc.TextureSize) && layerId > 0)
+		// If the layer and textures are created but sizes differ, force re-creating them.
+		// If the layer needed textures but does not anymore (or vice versa), re-create as well.
+		bool textureSizesDiffer = !layerDesc.TextureSize.Equals(newDesc.TextureSize) && layerId > 0;
+		bool needsTextures = NeedsTexturesForShape(currentOverlayShape);
+		bool needsTextureChanged = NeedsTexturesForShape(prevOverlayShape) != needsTextures;
+		if (textureSizesDiffer || needsTextureChanged)
 		{
 			DestroyLayerTextures();
 			DestroyLayer();
@@ -996,25 +1114,36 @@ public class OVROverlay : MonoBehaviour
 
 		bool createdLayer = CreateLayer(newDesc.MipLevels, newDesc.SampleCount, newDesc.Format, newDesc.LayerFlags, newDesc.TextureSize, newDesc.Shape);
 
+
 		if (layerIndex == -1 || layerId <= 0)
-			return;
-
-		bool useMipmaps = (newDesc.MipLevels > 1);
-
-		createdLayer |= CreateLayerTextures(useMipmaps, newDesc.TextureSize, isHdr);
-
-		if (!isExternalSurface && (layerTextures[0].appTexture as RenderTexture != null))
-			isDynamic = true;
-
-		if (!LatchLayerTextures())
-			return;
-
-		// Don't populate the same frame image twice.
-		if (frameIndex > prevFrameIndex)
 		{
-			int stage = frameIndex % stageCount;
-			if (!PopulateLayer (newDesc.MipLevels, isHdr, newDesc.TextureSize, newDesc.SampleCount, stage))
+			if (createdLayer)
+			{
+				// Propagate the current shape and avoid the permanent state of "needs texture changed"
+				prevOverlayShape = currentOverlayShape;
+			}
+			return;
+		}
+
+		if (needsTextures)
+		{
+			bool useMipmaps = (newDesc.MipLevels > 1);
+
+			createdLayer |= CreateLayerTextures(useMipmaps, newDesc.TextureSize, isHdr);
+
+			if (!isExternalSurface && (layerTextures[0].appTexture as RenderTexture != null))
+				isDynamic = true;
+
+			if (!LatchLayerTextures())
 				return;
+
+			// Don't populate the same frame image twice.
+			if (frameIndex > prevFrameIndex)
+			{
+				int stage = frameIndex % stageCount;
+				if (!PopulateLayer(newDesc.MipLevels, isHdr, newDesc.TextureSize, newDesc.SampleCount, stage))
+					return;
+			}
 		}
 
 		bool isOverlayVisible = SubmitLayer(overlay, headLocked, noDepthBufferTesting, pose, scale, frameIndex);
